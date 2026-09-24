@@ -203,7 +203,173 @@ FROM streak_intervals
 ORDER BY streak_length DESC
 LIMIT 1;
 ```
-
 **Key Findings:**
 * Solved a highly complex structural data challenge (Gaps & Islands), which demonstrates exceptional logical query architecture and advanced production SQL competencies.
 * Uncovered key stability patterns across marketing operational streams, pinpointing which creative ad sets maintain consistent audience engagement without performance degradation or budget suspension.
+
+
+
+---
+
+## GA4 BigQuery Data Modeling for Business Intelligence (BI)
+
+### Event-Level E-Commerce Data Transformation & Pipeline Preparation
+**Business Question:** How can we restructure and clean raw, unstructured Google Analytics 4 (GA4) nested event logs from 2021 into a high-performance, session-level data model optimized for BI dashboard visualization?
+
+**Analytical Approach:** Developed a robust BigQuery SQL script to filter and transform raw e-commerce events. Converted the raw, nested `event_timestamp` into a human-readable, standardized date-time format using `TIMESTAMP_MICROS`. Extracted the nested session identifiers cleanly via `UNNEST(event_params)`. Implemented strict filters to isolate the core user conversion path from the public GA4 e-commerce sample dataset.
+
+```sql
+SELECT
+  TIMESTAMP_MICROS(event_timestamp) AS event_timestamp,
+  user_pseudo_id,
+  event_name,
+  (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
+  geo.country AS country,
+  device.category AS device_category,
+  traffic_source.source AS source,
+  traffic_source.medium AS medium,
+  traffic_source.name AS campaign
+FROM
+  `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_20210131`
+WHERE
+  event_name IN (
+    'session_start', 
+    'view_item', 
+    'add_to_cart', 
+    'begin_checkout', 
+    'add_shipping_info', 
+    'add_payment_info', 
+    'purchase'
+  )
+LIMIT 1000;
+```
+
+**Key Findings & Schema Modeled:**
+* **Schema Flattening:** Successfully transformed unstructured, nested GA4 JSON columns into a flat, relational table, significantly reducing query computational costs for BI tool connectors (like Tableau/Power BI).
+* **Funnel Readiness:** Mapped the exact end-to-end user behavioral pipeline (`session_start` ➡️ `view_item` ➡️ `add_to_cart` ➡️ `begin_checkout` ➡️ `add_shipping_info` ➡️ `add_payment_info` ➡️ `purchase`), laying the groundwork for precise conversion funnel drop-off analysis.
+
+
+
+
+---
+
+###  Traffic Channel Conversion Funnel Analysis
+**Business Question:** What are the baseline conversion rates from initial user sessions to high-intent actions (`add_to_cart`, `begin_checkout`, `purchase`) across different marketing traffic acquisition channels?
+
+**Analytical Approach:** Built an advanced aggregated funnel model inside BigQuery. To handle data quality edge cases where multiple users might share identical session IDs, implemented a unique composite key combining `user_pseudo_id` and `session_id` via `CONCAT`. Normalized null traffic fields using `COALESCE` to match industry standards `(direct / none / not set)`. Utilized conditional aggregation combined with `SAFE_DIVIDE` to calculate accurate performance metrics without causing mathematical execution crashes.
+
+```sql
+WITH prepared_data AS (
+  SELECT
+    DATE(TIMESTAMP_MICROS(event_timestamp)) AS event_date,
+    event_name,
+    user_pseudo_id,
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
+    traffic_source.source AS source,
+    traffic_source.medium AS medium,
+    traffic_source.name AS campaign
+  FROM
+    `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_20210131`
+  WHERE
+    event_name IN ('session_start', 'add_to_cart', 'begin_checkout', 'purchase')
+)
+SELECT
+  event_date,
+  COALESCE(source, '(direct)') AS source,
+  COALESCE(medium, '(none)') AS medium,
+  COALESCE(campaign, '(not set)') AS campaign,
+  COUNT(DISTINCT CONCAT(user_pseudo_id, CAST(session_id AS STRING))) AS user_sessions_count,
+  ROUND(SAFE_DIVIDE(
+    COUNT(DISTINCT CASE WHEN event_name = 'add_to_cart' THEN CONCAT(user_pseudo_id, CAST(session_id AS STRING)) END),
+    COUNT(DISTINCT CONCAT(user_pseudo_id, CAST(session_id AS STRING)))
+  ) * 100, 2) AS visit_to_cart,
+  ROUND(SAFE_DIVIDE(
+    COUNT(DISTINCT CASE WHEN event_name = 'begin_checkout' THEN CONCAT(user_pseudo_id, CAST(session_id AS STRING)) END),
+    COUNT(DISTINCT CONCAT(user_pseudo_id, CAST(session_id AS STRING)))
+  ) * 100, 2) AS visit_to_checkout,
+  ROUND(SAFE_DIVIDE(
+    COUNT(DISTINCT CASE WHEN event_name = 'purchase' THEN CONCAT(user_pseudo_id, CAST(session_id AS STRING)) END),
+    COUNT(DISTINCT CONCAT(user_pseudo_id, CAST(session_id AS STRING)))
+  ) * 100, 2) AS visit_to_purchase
+FROM
+  prepared_data
+WHERE
+  session_id IS NOT NULL
+GROUP BY
+  event_date,
+  source,
+  medium,
+  campaign
+ORDER BY
+  user_sessions_count DESC
+LIMIT 500;
+```
+
+**Key Findings & Business Impact:**
+* **Funnel Optimization:** Enabled granular calculation of marketing funnel velocity (e.g., Session-to-Cart Conversion, Session-to-Purchase Conversion), helping performance marketers pinpoint exactly where user drop-off occurs.
+* **ROI Attribution:** Allowed direct cross-channel evaluation to determine which source/medium combinations bring high-volume traffic versus high-converting traffic.
+
+
+---
+
+###  Landing Page Conversion Performance Analysis
+**Business Question:** Which initial landing pages (entry URLs) generate the highest volume of traffic, and which ones achieve the best final purchase conversion rates?
+
+**Analytical Approach:** Developed an advanced attribution model using multiple Common Table Expressions (CTEs) and relational `LEFT JOIN` logic. Extracted clean URL paths by applying regular expressions (`REGEXP_EXTRACT`) on nested `page_location` parameters during `session_start` events. Queried wildcard historical tables (`events_2020*`) to process the 2020 dataset efficiently. Integrated session data with purchase data via a multi-key join (`user_pseudo_id` and `session_id`) and calculated standard session-to-purchase conversion rates (CR) using `SAFE_DIVIDE`.
+
+```sql
+WITH session_landing_pages AS (
+  SELECT
+    user_pseudo_id,
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
+    REGEXP_EXTRACT(
+      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location'),
+      r'https?://[^/]+(/[^?#]*)'
+    ) AS landing_page_path
+  FROM
+    `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_2020*`
+  WHERE
+    event_name = 'session_start'
+),
+session_purchases AS (
+  SELECT
+    user_pseudo_id,
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
+    COUNT(*) AS purchase_count
+  FROM
+    `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_2020*`
+  WHERE
+    event_name = 'purchase'
+  GROUP BY
+    user_pseudo_id,
+    session_id
+)
+SELECT
+  COALESCE(lp.landing_page_path, '/') AS landing_page_path,
+  COUNT(DISTINCT CONCAT(lp.user_pseudo_id, CAST(lp.session_id AS STRING))) AS user_sessions_count,
+  COALESCE(SUM(p.purchase_count), 0) AS total_purchases,
+  ROUND(
+    SAFE_DIVIDE(
+      COUNT(DISTINCT CASE WHEN p.purchase_count > 0 THEN CONCAT(lp.user_pseudo_id, CAST(lp.session_id AS STRING)) END),
+      COUNT(DISTINCT CONCAT(lp.user_pseudo_id, CAST(lp.session_id AS STRING)))
+    ) * 100, 2
+  ) AS session_to_purchase_conversion_rate
+FROM
+  session_landing_pages lp
+LEFT JOIN
+  session_purchases p 
+  ON lp.user_pseudo_id = p.user_pseudo_id 
+  AND lp.session_id = p.session_id
+WHERE
+  lp.session_id IS NOT NULL
+GROUP BY
+  landing_page_path
+ORDER BY
+  user_sessions_count DESC
+LIMIT 500;
+```
+
+**Key Findings & Business Impact:**
+* **UX & Content Optimization:** Identified the exact high-traffic entry points that underperform in conversion, signaling a need for better user experience (UX) or copy optimization on those specific landing pages.
+* **Data Cleansing:** Implemented precise string parsing (`REGEXP_EXTRACT`) to strip parameters and queries from URLs, ensuring that page performance data is aggregated accurately without fragmentation.
+
